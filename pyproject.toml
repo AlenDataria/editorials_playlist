@@ -5,6 +5,8 @@ description = "Track which of our Spotify tracks appear in Italian editorial pla
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "apify-client>=1.0",
+    "boto3>=1.34",
     "psycopg2-binary>=2.9.12",
     "python-dotenv>=1.2.2",
     "requests>=2.32",

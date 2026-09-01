@@ -48,7 +48,7 @@ def main(argv: list[str] | None = None) -> int:
     session.headers.update(HTTP_HEADERS)
 
     for ed in chosen:
-        print(f"\n=== {ed.name}  ({ed.playlist_id})  cadence={ed.update_cadence} ===")
+        print(f"\n=== {ed.name}  ({ed.playlist_id}) ===")
         try:
             tracks = fetch_playlist_tracklist(ed.playlist_id, session)
         except PlaylistUnavailable:

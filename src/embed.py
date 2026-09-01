@@ -49,11 +49,13 @@ class EmbedParseError(RuntimeError):
 
 
 class PlaylistUnavailable(RuntimeError):
-    """The embed page rendered a 404 for this playlist id.
+    """The embed page rendered a 404-shaped payload for this playlist id.
 
-    Deliberately NOT an EmbedParseError so `fetch_playlist_tracklist` does not
-    retry it: some Spotify-owned playlists (e.g. the Viral 50 charts) are simply
-    not served through the embed endpoint, and that will not change on retry.
+    The embed endpoint intermittently returns this for playlists that are
+    perfectly fine, so `fetch_playlist_tracklist` retries it like any other
+    transient error. A playlist that is genuinely not served (it used to be the
+    Viral 50 charts) simply exhausts the retries and is then skipped by the
+    caller.
     """
 
 
@@ -107,7 +109,7 @@ def parse_tracklist(html: str) -> list[PlaylistTrack]:
     max_retries=MAX_RETRIES,
     delay=RETRY_DELAY,
     backoff=RETRY_BACKOFF,
-    exceptions=(requests.RequestException, EmbedParseError),
+    exceptions=(requests.RequestException, EmbedParseError, PlaylistUnavailable),
 )
 def fetch_playlist_tracklist(
     playlist_id: str, session: requests.Session

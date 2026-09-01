@@ -1,17 +1,19 @@
 """EditorialsTracker: the daily run.
 
-For each playlist in `EDITORIALS`: fetch its current track list from the embed
-endpoint, match it against our campaign-active Spotify tracks, and write one
-`editorial_playlist_entries` snapshot row per match for today.
+The pipeline keeps one row per *stint* — a continuous period a track spent in an
+editorial playlist. Which stints are currently open is held in a small JSON
+state document (src/state.py), not inferred from the history table:
 
-Matching is layered:
-  1. exact `spotify_id` equality (the embed gives us the track id directly);
-  2. fuzzy title+artist fallback (src/matching.py) for tracks our DB holds under
-     a different id than the one in the editorial.
+  - track in the playlist now, not in the state    -> new row (`end_date` NULL),
+    artists resolved via src/artists.py; added to the state;
+  - track in the playlist now and in the state      -> nothing in the DB; its
+    `last_seen` in the state is moved to today;
+  - track in the state but gone from the playlist   -> its open row gets
+    `end_date = last_seen` (the last date it was there); removed from the state.
 
-Resilience mirrors song_resolver_tracker: commit per playlist so a later failure
-never loses earlier progress, and a playlist that fails is logged and skipped
-rather than aborting the whole run.
+A playlist that fails to fetch (or returns nothing) is logged and skipped: its
+state entries are left untouched, so nothing is closed by mistake. The DB
+changes and the state file are written per playlist.
 """
 
 import logging
@@ -19,212 +21,277 @@ import time
 from datetime import date
 
 import requests
-from sqlalchemy import func
-from sqlalchemy.dialects.postgresql import aggregate_order_by
-from sqlmodel import Session, select
+from sqlalchemy import func, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import SQLAlchemyError
+from sqlmodel import Session, SQLModel
 
+from src.artists import ArtistResolver, split_artist_names
 from src.consts import EDITORIALS, HTTP_HEADERS, REQUEST_DELAY, Editorial
 from src.db import create_db_engine, db_config_from_env
 from src.embed import PlaylistTrack, PlaylistUnavailable, fetch_playlist_tracklist
-from src.matching import is_track_match
-from src.models import (
-    EditorialPlaylistEntry,
-    SourceTrack,
-    SpotifyTrack,
-    SpotifyTrackArtists,
-)
+from src.models import EditorialPlaylist, EditorialPlaylistStorico
+from src.state import StateStore, empty_doc, open_stints
 
 logger = logging.getLogger(__name__)
 
+_OWNED_TABLES = [EditorialPlaylist.__table__, EditorialPlaylistStorico.__table__]
+
+
+def diff_playlist(
+    present_ids: set[str], open_ids: set[str]
+) -> tuple[set[str], set[str], set[str]]:
+    """Split the current tracklist against the open-stint state.
+
+    Returns (to_open, to_close, to_keep):
+      - to_open  : present now, no open stint      -> start a new stint;
+      - to_close : had an open stint, gone now     -> close it;
+      - to_keep  : present now and already open    -> just refresh last_seen.
+    """
+    return (
+        present_ids - open_ids,
+        open_ids - present_ids,
+        present_ids & open_ids,
+    )
+
 
 class EditorialsTracker:
-    """Snapshot our tracks' presence and position in the tracked editorials."""
+    """Maintain the stint history of every track in the tracked editorials."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, use_apify: bool = True) -> None:
         self.engine = create_db_engine(db_config_from_env())
+        self.use_apify = use_apify
         self.session = requests.Session()
         self.session.headers.update(HTTP_HEADERS)
 
-    def _ensure_table(self) -> None:
-        """Create editorial_playlist_entries if missing (no migration tool here).
-
-        `checkfirst=True` only issues CREATE when the table is absent, so a role
-        without DDL rights still works once the table has been created by hand
-        (see sql/editorial_playlist_entries.ddl.sql).
-        """
+    # ------------------------------------------------------------------ #
+    # setup                                                             #
+    # ------------------------------------------------------------------ #
+    def _ensure_tables(self) -> None:
+        """Create the owned tables if missing (no migration tool here)."""
         try:
-            EditorialPlaylistEntry.__table__.create(
-                bind=self.engine, checkfirst=True
+            SQLModel.metadata.create_all(
+                self.engine, tables=_OWNED_TABLES, checkfirst=True
             )
         except Exception:
             logger.exception(
-                "could not create %s - have a DBA create it from "
-                "sql/editorial_playlist_entries.ddl.sql, then re-run",
-                EditorialPlaylistEntry.__tablename__,
+                "could not create the owned tables - have a DBA apply "
+                "sql/schema.sql, then re-run"
             )
             raise
 
+    def _upsert_registry(self, db: Session) -> None:
+        """Make `editorial_playlists` match `EDITORIALS`."""
+        stmt = pg_insert(EditorialPlaylist.__table__).values(
+            [{"playlist_id": e.playlist_id, "playlist_name": e.name} for e in EDITORIALS]
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["playlist_id"],
+            set_={"playlist_name": stmt.excluded.playlist_name},
+        )
+        db.execute(stmt)
+        db.commit()
+
+    def _reconstruct_state(self, db: Session) -> dict:
+        """Rebuild the state document from the open rows in the DB.
+
+        Used only when the state file is missing (first run, or it was lost):
+        without this every open track would look new and get a duplicate row.
+        """
+        doc = empty_doc()
+        try:
+            rows = db.execute(
+                select(
+                    EditorialPlaylistStorico.playlist_id,
+                    EditorialPlaylistStorico.track_id,
+                    func.min(EditorialPlaylistStorico.start_date),
+                )
+                .where(EditorialPlaylistStorico.end_date.is_(None))
+                .group_by(
+                    EditorialPlaylistStorico.playlist_id,
+                    EditorialPlaylistStorico.track_id,
+                )
+            ).all()
+        except SQLAlchemyError:
+            db.rollback()
+            logger.warning(
+                "could not read %s - starting from an empty state",
+                EditorialPlaylistStorico.__tablename__,
+            )
+            return doc
+
+        for playlist_id, track_id, start in rows:
+            iso = start.isoformat()
+            open_stints(doc, playlist_id)[track_id] = {"start": iso, "last_seen": iso}
+        if rows:
+            logger.warning("rebuilt state from %d open rows in the DB", len(rows))
+        return doc
+
     # ------------------------------------------------------------------ #
-    # run                                                                #
+    # run                                                               #
     # ------------------------------------------------------------------ #
     def run(self, dry_run: bool = False) -> None:
         today = date.today()
         if not dry_run:
-            self._ensure_table()
-        with Session(self.engine) as db:
-            our_tracks = self._active_spotify_tracks(db)
-            by_id = {t.spotify_id: t for t in our_tracks}
-            logger.info("loaded %d campaign-active spotify tracks", len(our_tracks))
+            self._ensure_tables()
 
-            total_rows = 0
-            for ed in EDITORIALS:
-                try:
-                    tracklist = fetch_playlist_tracklist(ed.playlist_id, self.session)
-                except PlaylistUnavailable:
-                    # Known-tolerated: some Spotify charts (Viral 50) are not
-                    # served via the embed endpoint. Skip quietly, no traceback.
-                    logger.warning(
-                        "editorial %s (%s) is not available via embed - skipping",
-                        ed.name, ed.playlist_id,
-                    )
-                    continue
-                except Exception:
-                    logger.exception("skipping editorial %s (%s)", ed.name, ed.playlist_id)
-                    continue
-
-                rows = self._match_rows(ed, tracklist, our_tracks, by_id, today)
-                logger.info(
-                    "%s: %d/%d playlist tracks are ours", ed.name, len(rows), len(tracklist)
+        # 1. fetch every playlist up front
+        fetched: list[tuple[Editorial, list[PlaylistTrack]]] = []
+        for ed in EDITORIALS:
+            try:
+                tracklist = fetch_playlist_tracklist(ed.playlist_id, self.session)
+            except PlaylistUnavailable:
+                logger.warning(
+                    "editorial %s (%s) still 404s after retries - skipping",
+                    ed.name, ed.playlist_id,
                 )
+            except Exception:
+                logger.exception("skipping editorial %s (%s)", ed.name, ed.playlist_id)
+            else:
+                if not tracklist:
+                    logger.warning(
+                        "editorial %s (%s) returned no tracks - skipping (state "
+                        "left untouched)", ed.name, ed.playlist_id,
+                    )
+                else:
+                    fetched.append((ed, tracklist))
+                    logger.info("%s: %d tracks", ed.name, len(tracklist))
+            time.sleep(REQUEST_DELAY)
+
+        store = StateStore()
+        doc = store.load()
+
+        with Session(self.engine) as db:
+            if not dry_run:
+                self._upsert_registry(db)
+            if doc is None:
+                logger.warning(
+                    "no state file at %s - reconstructing from the DB", store.location
+                )
+                doc = self._reconstruct_state(db)
+
+            # 2. plan per playlist, then resolve artist ids for the new tracks only
+            plans: dict[str, tuple[set[str], set[str], set[str]]] = {}
+            for ed, tracklist in fetched:
+                present_ids = {pt.spotify_id for pt in tracklist}
+                open_ids = set(open_stints(doc, ed.playlist_id))
+                plans[ed.playlist_id] = diff_playlist(present_ids, open_ids)
+
+            resolver = ArtistResolver(self.engine, use_apify=self.use_apify)
+            resolver.load_db_map()
+
+            need_apify: set[str] = set()
+            for ed, tracklist in fetched:
+                to_open, _, _ = plans[ed.playlist_id]
+                for pt in tracklist:
+                    if pt.spotify_id not in to_open:
+                        continue
+                    if any(
+                        not resolver.is_known(n)
+                        for n in split_artist_names(pt.artists)
+                    ):
+                        need_apify.add(pt.spotify_id)
+            if need_apify:
+                logger.info(
+                    "%d new tracks need an Apify lookup for artist ids", len(need_apify)
+                )
+                resolver.enrich_via_apify(need_apify)
+
+            # 3. apply per playlist: close, open, refresh last_seen, save state
+            opened = closed = 0
+            for ed, tracklist in fetched:
+                to_open, to_close, to_keep = plans[ed.playlist_id]
+                pl_state = open_stints(doc, ed.playlist_id)
+                new_rows = self._rows_for_new_stints(
+                    ed, tracklist, to_open, resolver, today
+                )
+                opened += len(to_open)
+                closed += len(to_close)
 
                 if dry_run:
-                    for r in rows:
+                    logger.info(
+                        "%s: open %d new stint(s) (%d rows), close %d, keep %d",
+                        ed.name, len(to_open), len(new_rows), len(to_close),
+                        len(to_keep),
+                    )
+                    for r in new_rows:
                         logger.info(
-                            "  would write: pos=%3d  %s - %s  [%s]",
-                            r.position, r.track_name, r.artist_name, r.spotify_id,
+                            "  open: %s - %s  track=%s artist=%s",
+                            r.track_name, r.artist_name, r.track_id, r.artist_id,
                         )
                     continue
 
-                for r in rows:
-                    db.add(r)
                 try:
+                    for track_id in to_close:
+                        last_seen = date.fromisoformat(pl_state[track_id]["last_seen"])
+                        db.execute(
+                            update(EditorialPlaylistStorico)
+                            .where(
+                                EditorialPlaylistStorico.playlist_id == ed.playlist_id,
+                                EditorialPlaylistStorico.track_id == track_id,
+                                EditorialPlaylistStorico.end_date.is_(None),
+                            )
+                            .values(end_date=last_seen)
+                        )
+                    db.add_all(new_rows)
                     db.commit()
                 except Exception:
                     db.rollback()
-                    logger.exception("commit failed for editorial %s", ed.playlist_id)
+                    logger.exception("write failed for editorial %s", ed.playlist_id)
+                    opened -= len(to_open)
+                    closed -= len(to_close)
                     continue
-                total_rows += len(rows)
-                time.sleep(REQUEST_DELAY)
+
+                for track_id in to_close:
+                    pl_state.pop(track_id, None)
+                for track_id in to_keep:
+                    pl_state[track_id]["last_seen"] = today.isoformat()
+                for pt in tracklist:
+                    if pt.spotify_id in to_open:
+                        pl_state[pt.spotify_id] = {
+                            "start": today.isoformat(),
+                            "last_seen": today.isoformat(),
+                        }
+                store.save(doc)
 
             logger.info(
-                "done: wrote %d snapshot rows for %s across %d editorials",
-                total_rows, today, len(EDITORIALS),
+                "done: %s - opened %d, closed %d, across %d editorials",
+                today, opened, closed, len(fetched),
             )
 
     # ------------------------------------------------------------------ #
-    # helpers                                                            #
+    # helpers                                                           #
     # ------------------------------------------------------------------ #
-    def _active_spotify_tracks(self, session: Session) -> list[SourceTrack]:
-        """Every campaign-active Spotify track with its artists, one row per track.
-
-        `active IS NOT false` keeps rows where active is true or NULL. Artists are
-        aggregated in a stable order (by artist_id) so ", ".join is deterministic.
-        Same query shape as song_resolver_tracker's load_spotify_tracks.
-        """
-        statement = (
-            select(
-                SpotifyTrack.spotify_id,
-                SpotifyTrack.track_name,
-                SpotifyTrack.album_name,
-                func.array_agg(
-                    aggregate_order_by(
-                        SpotifyTrackArtists.artist_name,
-                        SpotifyTrackArtists.artist_id,
-                    )
-                )
-                .filter(SpotifyTrackArtists.artist_name.isnot(None))
-                .label("artist_names"),
-            )
-            .join(
-                SpotifyTrackArtists,
-                SpotifyTrackArtists.spotify_track_id == SpotifyTrack.spotify_id,
-                isouter=True,
-            )
-            .where(SpotifyTrack.active.isnot(False))
-            .group_by(SpotifyTrack.spotify_id)
-        )
-
-        tracks: list[SourceTrack] = []
-        for row in session.exec(statement):
-            tracks.append(
-                SourceTrack(
-                    spotify_id=row.spotify_id,
-                    track_name=row.track_name,
-                    album_name=row.album_name,
-                    artist_names=list(row.artist_names or []),
-                )
-            )
-        return tracks
-
-    def _match_rows(
+    def _rows_for_new_stints(
         self,
         editorial: Editorial,
         tracklist: list[PlaylistTrack],
-        our_tracks: list[SourceTrack],
-        by_id: dict[str, SourceTrack],
+        to_open: set[str],
+        resolver: ArtistResolver,
         today: date,
-    ) -> list[EditorialPlaylistEntry]:
-        """Turn a playlist track list into snapshot rows for our matched tracks.
+    ) -> list[EditorialPlaylistStorico]:
+        """One row per (track, artist) for the tracks starting a new stint.
 
-        Walks the playlist in order, so the first time a track of ours is seen we
-        record its (lowest) position. A track of ours appearing twice in the same
-        playlist (rare) keeps the better position.
+        A track with no parseable artist string still yields a single row (with
+        artist_name and artist_id NULL) so the stint is recorded.
         """
-        # spotify_id (ours) -> best position seen so far
-        best_position: dict[str, int] = {}
-        matched_by: dict[str, str] = {}
-
+        rows: list[EditorialPlaylistStorico] = []
         for pt in tracklist:
-            our = by_id.get(pt.spotify_id)
-            how = "spotify_id"
-            if our is None:
-                our = next(
-                    (
-                        t
-                        for t in our_tracks
-                        if is_track_match(
-                            t.track_name, t.artist_names, pt.title, pt.artists
-                        )
-                    ),
-                    None,
-                )
-                how = "fuzzy"
-            if our is None:
+            if pt.spotify_id not in to_open:
                 continue
-
-            if our.spotify_id not in best_position or pt.position < best_position[our.spotify_id]:
-                best_position[our.spotify_id] = pt.position
-                matched_by[our.spotify_id] = how
-
-        rows: list[EditorialPlaylistEntry] = []
-        for spotify_id, position in best_position.items():
-            our = by_id[spotify_id]
-            if matched_by[spotify_id] == "fuzzy":
-                logger.debug(
-                    "fuzzy match in %s: our '%s' <- playlist pos %d",
-                    editorial.name, our.track_name, position,
+            names = split_artist_names(pt.artists) or [None]
+            for name in names:
+                artist_id = resolver.resolve(pt.spotify_id, name) if name else None
+                rows.append(
+                    EditorialPlaylistStorico(
+                        playlist_id=editorial.playlist_id,
+                        playlist_name=editorial.name,
+                        track_name=pt.title or None,
+                        track_id=pt.spotify_id,
+                        artist_name=name,
+                        artist_id=artist_id,
+                        start_date=today,
+                        end_date=None,
+                    )
                 )
-            rows.append(
-                EditorialPlaylistEntry(
-                    playlist_id=editorial.playlist_id,
-                    spotify_id=spotify_id,
-                    snapshot_date=today,
-                    playlist_name=editorial.name,
-                    track_name=our.track_name,
-                    artist_name=", ".join(our.artist_names) or None,
-                    album_name=our.album_name,
-                    position=position,
-                )
-            )
-        rows.sort(key=lambda r: r.position)
         return rows

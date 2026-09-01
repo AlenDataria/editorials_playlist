@@ -1,57 +1,64 @@
-"""SQLModel tables and the SourceTrack dataclass.
+"""SQLModel tables for the editorials_playlist pipeline.
 
-- `EditorialPlaylistEntry` is owned by this pipeline: one row per
-  (playlist, our track, day). It is created at runtime with
-  `__table__.create(..., checkfirst=True)` — there is no migration tool in this
-  repo, same pattern as song_resolver_tracker's `tiktok_unresolved_tracks`.
-- `SpotifyTrack` / `SpotifyTrackArtists` mirror the shared source tables and are
-  used read-only, exactly as in
-  song_resolver_tracker/src/platforms/tiktok/models.py.
+Owned by this pipeline (created at runtime with `metadata.create_all(...,
+checkfirst=True)` — no migration tool in this repo):
+
+- `EditorialPlaylist` — registry of the tracked playlists (id + name). Mirrors
+  `EDITORIALS` in src/consts.py; re-upserted on every run.
+- `EditorialPlaylistStorico` — stint history: one row per
+  (playlist, track, artist, stint), with a `start_date` / `end_date` window.
+
+`SpotifyTrackArtists` mirrors the shared source table and is read-only: it is
+the first place we look for an `artist_id` given an artist name.
 """
 
-from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date
 
 from sqlmodel import Field, SQLModel
 
 from src.consts import DB_SCHEMA
 
 
-class EditorialPlaylistEntry(SQLModel, table=True):
-    """A daily snapshot: this track was in this editorial, at this position."""
+class EditorialPlaylist(SQLModel, table=True):
+    """Registry row: one tracked editorial playlist."""
 
-    __tablename__ = "editorial_playlist_entries"
+    __tablename__ = "editorial_playlists"
     __table_args__ = {"schema": DB_SCHEMA}
 
     playlist_id: str = Field(primary_key=True)
-    spotify_id: str = Field(primary_key=True)  # = spotify_tracks.spotify_id
-    snapshot_date: date = Field(primary_key=True)
-
-    playlist_name: str | None = Field(default=None)
-    track_name: str | None = Field(default=None)      # from our data
-    artist_name: str | None = Field(default=None)     # our artists, joined with ", "
-    album_name: str | None = Field(default=None)      # from our data (embed has no album)
-    position: int = Field()                           # 1-based rank in the playlist
-    created_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
+    playlist_name: str
 
 
-class SpotifyTrack(SQLModel, table=True):
-    """Read-only mirror of the shared `spotify_tracks` source table."""
+class EditorialPlaylistStorico(SQLModel, table=True):
+    """One stint of a track in an editorial playlist, one row per credited artist.
 
-    __tablename__ = "spotify_tracks"
+    A "stint" is a continuous period the track was in the playlist:
+    - `start_date` — first run that saw the track in the playlist (this stint);
+    - `end_date`   — NULL while the track is still in the playlist; set to the
+      last date it was present once a run finds it gone.
+
+    Which stints are open is tracked out-of-band in the state document
+    (src/state.py), not inferred from this table. A track that leaves and later
+    returns gets a new row. `artist_id` is NULL when it could not be resolved
+    from our data or Apify.
+    """
+
+    __tablename__ = "editorial_playlists_storico"
     __table_args__ = {"schema": DB_SCHEMA}
 
-    spotify_id: str = Field(primary_key=True)
+    id: int | None = Field(default=None, primary_key=True)
+
+    playlist_id: str = Field(
+        foreign_key=f"{DB_SCHEMA}.editorial_playlists.playlist_id",
+        index=True,
+    )
+    playlist_name: str | None = Field(default=None)
     track_name: str | None = Field(default=None)
-    album_id: str | None = Field(default=None)
-    album_name: str | None = Field(default=None)
-    release_type: str | None = Field(default=None)
-    release_date: date | None = Field(default=None)
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    # Campaign toggle: only tracks with active != false are tracked.
-    active: bool | None = Field(default=True)
+    track_id: str = Field(index=True)
+    artist_name: str | None = Field(default=None)
+    artist_id: str | None = Field(default=None, index=True)
+    start_date: date = Field(index=True)
+    end_date: date | None = Field(default=None, index=True)
 
 
 class SpotifyTrackArtists(SQLModel, table=True):
@@ -63,13 +70,3 @@ class SpotifyTrackArtists(SQLModel, table=True):
     spotify_track_id: str = Field(primary_key=True)
     artist_id: str = Field(primary_key=True)
     artist_name: str | None = Field(default=None)
-
-
-@dataclass
-class SourceTrack:
-    """One of our Spotify tracks, with all of its artists kept together."""
-
-    spotify_id: str
-    track_name: str | None
-    album_name: str | None
-    artist_names: list[str] = field(default_factory=list)

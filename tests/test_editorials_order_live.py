@@ -38,7 +38,7 @@ pytestmark = pytest.mark.skipif(
     reason="live test - needs RUN_LIVE_TESTS=1 and SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET",
 )
 
-EXPECTED_UNAVAILABLE = {"37i9dQZEVXbKbvcwe5owJ1"}  # Viral 50 - not on the embed
+EXPECTED_UNAVAILABLE: set[str] = set()  # Viral 50 (the only known-404) is no longer tracked
 EMBED_CAP = 100
 
 

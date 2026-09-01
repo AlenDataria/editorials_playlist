@@ -1,48 +1,48 @@
--- Read-time views over social_golden_data.editorial_playlist_entries.
--- Apply once after the first pipeline run has created the table.
--- See "Documentazione editorials_playlist.md", Step 4.
+-- Read-time views over social_golden_data.editorial_playlists_storico.
+-- Apply once after the first pipeline run has created the tables.
 
--- a) How many editorials a track is in on a given day, and which ones.
+-- Tracks currently in a playlist: their stint is still open (end_date IS NULL).
+CREATE OR REPLACE VIEW social_golden_data.vw_editorial_current AS
+SELECT *
+FROM social_golden_data.editorial_playlists_storico
+WHERE end_date IS NULL;
+
+
+-- a) How many editorials a track is currently in, and which ones.
 CREATE OR REPLACE VIEW social_golden_data.vw_track_editorial_count AS
 SELECT
-    spotify_id,
-    snapshot_date,
-    count(*)                                        AS editorial_count,
-    array_agg(playlist_name ORDER BY playlist_name) AS playlists
-FROM social_golden_data.editorial_playlist_entries
-GROUP BY spotify_id, snapshot_date;
+    track_id,
+    max(track_name)                                     AS track_name,
+    count(DISTINCT playlist_id)                         AS editorial_count,
+    array_agg(DISTINCT playlist_name ORDER BY playlist_name) AS playlists
+FROM social_golden_data.vw_editorial_current
+GROUP BY track_id;
 
 
--- b) Tenure: first/last day seen and total days present, per (track, editorial).
---    still_in = last_seen is the most recent snapshot in the table.
+-- b) How many editorials an artist is currently in (any of their tracks).
+CREATE OR REPLACE VIEW social_golden_data.vw_artist_editorial_count AS
+SELECT
+    artist_id,
+    max(artist_name)                                    AS artist_name,
+    count(DISTINCT playlist_id)                         AS editorial_count,
+    count(DISTINCT track_id)                            AS track_count,
+    array_agg(DISTINCT playlist_name ORDER BY playlist_name) AS playlists
+FROM social_golden_data.vw_editorial_current
+WHERE artist_id IS NOT NULL
+GROUP BY artist_id;
+
+
+-- c) Tenure: every stint of a track in an editorial, with its length and
+--    whether it is still open. days_present counts through today for open ones.
 CREATE OR REPLACE VIEW social_golden_data.vw_track_editorial_tenure AS
 SELECT
-    e.spotify_id,
-    e.playlist_id,
-    e.playlist_name,
-    min(e.snapshot_date) AS first_seen,
-    max(e.snapshot_date) AS last_seen,
-    count(*)             AS days_present,
-    max(e.snapshot_date) = (SELECT max(snapshot_date)
-                            FROM social_golden_data.editorial_playlist_entries)
-                        AS still_in
-FROM social_golden_data.editorial_playlist_entries e
-GROUP BY e.spotify_id, e.playlist_id, e.playlist_name;
-
-
--- c) Position over time with rise/fall vs the previous snapshot.
---    delta > 0 means the track moved up (towards #1).
-CREATE OR REPLACE VIEW social_golden_data.vw_track_position_trend AS
-SELECT
-    spotify_id,
+    track_id,
+    max(track_name)                                        AS track_name,
     playlist_id,
-    playlist_name,
-    snapshot_date,
-    position,
-    lag(position) OVER w             AS prev_position,
-    lag(position) OVER w - position  AS delta
-FROM social_golden_data.editorial_playlist_entries
-WINDOW w AS (PARTITION BY spotify_id, playlist_id ORDER BY snapshot_date);
-
--- d) Viral road: NOT implemented yet (see Step 4). When the editorial->stage
---    mapping is agreed, add a vw_track_viral_road view here over this same table.
+    max(playlist_name)                                     AS playlist_name,
+    start_date,
+    end_date,
+    (COALESCE(end_date, CURRENT_DATE) - start_date) + 1    AS days_present,
+    end_date IS NULL                                       AS still_in
+FROM social_golden_data.editorial_playlists_storico
+GROUP BY track_id, playlist_id, start_date, end_date;

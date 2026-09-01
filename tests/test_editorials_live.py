@@ -25,9 +25,9 @@ pytestmark = pytest.mark.skipif(
     reason="live network test - set RUN_LIVE_TESTS=1 to run",
 )
 
-# Playlists we KNOW the embed endpoint does not serve (see src/consts.py note).
-# These are expected to raise PlaylistUnavailable rather than return tracks.
-EXPECTED_UNAVAILABLE = {"37i9dQZEVXbKbvcwe5owJ1"}  # Viral 50 - Italia
+# Playlists we KNOW the embed endpoint does not serve. Empty now that Viral 50 -
+# Italia (the only known-404 one) has been dropped from EDITORIALS.
+EXPECTED_UNAVAILABLE: set[str] = set()
 
 
 @pytest.fixture(scope="module")
