@@ -3,8 +3,8 @@
 
 locals {
   editorials_job_name        = "daily-editorials-playlist-snapshot"
-  editorials_job_description  = "Daily editorial-playlist snapshot at 00:00"
-  editorials_schedule         = "cron(0 0 * * ? *)"
+  editorials_job_description = "Daily editorial-playlist snapshot at 00:00"
+  editorials_schedule        = "cron(0 0 * * ? *)"
 }
 
 resource "aws_scheduler_schedule" "daily_editorials_pipeline" {
@@ -13,9 +13,8 @@ resource "aws_scheduler_schedule" "daily_editorials_pipeline" {
   group_name                   = aws_scheduler_schedule_group.ep_jobs.name
   schedule_expression          = local.editorials_schedule
   schedule_expression_timezone = var.timezone
-  # DEV: schedule is created but paused during code review. Set back to
-  # "ENABLED" and re-apply once the code is approved to start the daily runs.
-  state                        = "DISABLED"
+  # Live: fires daily at 00:00 UTC (02:00 Europe/Rome). Set to "DISABLED" to pause.
+  state = "ENABLED"
 
   flexible_time_window {
     mode = "OFF"

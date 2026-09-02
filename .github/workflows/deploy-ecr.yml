@@ -1,18 +1,15 @@
 name: Build and push image to ECR
 
 on:
-  # DEV: automatic build/push is OFF during code review. Re-enable it by
-  # restoring the `push:` trigger below (and dropping `workflow_dispatch`)
-  # once the code is approved.
   workflow_dispatch:
-  # push:
-  #   branches:
-  #     - main
-  #   # Changes that never end up inside the image don't need a build.
-  #   paths-ignore:
-  #     - "terraform/**"
-  #     - "sql/**"
-  #     - "**.md"
+  push:
+    branches:
+      - main
+    # Changes that never end up inside the image don't need a build.
+    paths-ignore:
+      - "terraform/**"
+      - "sql/**"
+      - "**.md"
 
 # A newer commit on main supersedes any build still in progress.
 concurrency:
