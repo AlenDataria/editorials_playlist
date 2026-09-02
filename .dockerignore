@@ -6,5 +6,6 @@ tests/
 terraform/
 docs/
 *.md
+!README.md
 .env
 .DS_Store
