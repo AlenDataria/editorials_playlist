@@ -7,22 +7,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse CLI arguments."""
     parser = argparse.ArgumentParser(
         description=(
-            "Snapshot every track and artist in the tracked Italian editorial "
-            "playlists, one row per (playlist, track, artist) per day."
+            "Track every track in the tracked Italian editorial playlists as "
+            "stints (start_date / end_date) in social_golden_data."
         )
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="fetch and log what would be written, without touching the DB",
-    )
-    parser.add_argument(
-        "--no-apify",
-        action="store_true",
-        help=(
-            "skip the Apify fallback for artist ids; artist_id stays NULL "
-            "wherever our own data has no match"
-        ),
     )
     parser.add_argument(
         "--log-level",

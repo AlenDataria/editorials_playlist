@@ -55,12 +55,6 @@ variable "secrets_manager_arn" {
   default     = ""
 }
 
-variable "state_s3_bucket" {
-  description = "S3 bucket for the open-stint state file (key prefix editorial_playlist_state/). Leave empty to run with a local state file only."
-  type        = string
-  default     = ""
-}
-
 variable "github_repository" {
   description = "GitHub repository (owner/name) allowed to push images via OIDC"
   type        = string
@@ -80,7 +74,7 @@ variable "github_oidc_provider_arn" {
 }
 
 variable "secrets_manager_keys" {
-  description = "Secret keys to inject from AWS Secrets Manager as environment variables. Names must match what the app reads: DB_* (src/db.py) and SPOTIFY_API_KEY (the Apify token, src/artists.py)."
+  description = "Secret keys to inject from AWS Secrets Manager as environment variables. Names must match what the app reads (src/db.py)."
   type        = list(string)
   default = [
     "DB_HOST",
@@ -88,6 +82,11 @@ variable "secrets_manager_keys" {
     "DB_NAME",
     "DB_USER",
     "DB_PASSWORD",
-    "SPOTIFY_API_KEY",
   ]
+}
+
+variable "alarm_sns_topic_arn" {
+  description = "Optional SNS topic ARN to notify when the run skips a playlist (editorials_playlists_skipped > 0). Empty = alarm with no action."
+  type        = string
+  default     = ""
 }

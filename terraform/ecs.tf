@@ -1,14 +1,5 @@
 locals {
   resolved_docker_image = var.docker_image != "" ? var.docker_image : "${aws_ecr_repository.ep.repository_url}:latest"
-
-  # Non-secret env for the open-stint state file on S3. Added only when a bucket
-  # is configured; otherwise the app falls back to a local file.
-  state_env = var.state_s3_bucket != "" ? [
-    { name = "S3_BUCKET_NAME", value = var.state_s3_bucket },
-    { name = "AWS_REGION", value = var.aws_region },
-  ] : []
-
-  container_env = concat(var.container_environment_vars, local.state_env)
 }
 
 resource "aws_ecs_cluster" "ep" {
@@ -134,25 +125,16 @@ resource "aws_iam_role_policy" "ecs_task_role_policy" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = concat(
-      [
-        {
-          Effect = "Allow"
-          Action = [
-            "logs:CreateLogStream",
-            "logs:PutLogEvents"
-          ]
-          Resource = "${aws_cloudwatch_log_group.ecs_tasks.arn}:*"
-        }
-      ],
-      var.state_s3_bucket != "" ? [
-        {
-          Effect   = "Allow"
-          Action   = ["s3:GetObject", "s3:PutObject"]
-          Resource = "arn:aws:s3:::${var.state_s3_bucket}/editorial_playlist_state/*"
-        }
-      ] : []
-    )
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "${aws_cloudwatch_log_group.ecs_tasks.arn}:*"
+      }
+    ]
   })
 }
 
@@ -180,7 +162,7 @@ resource "aws_ecs_task_definition" "ep" {
         }
       }
 
-      environment = local.container_env
+      environment = var.container_environment_vars
 
       secrets = var.secrets_manager_arn != "" && length(var.secrets_manager_keys) > 0 ? [
         for key in var.secrets_manager_keys : {

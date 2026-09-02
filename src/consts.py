@@ -15,24 +15,6 @@ DB_SCHEMA = "social_golden_data"
 # of the `__NEXT_DATA__` JSON blob in the returned HTML (see src/embed.py).
 EMBED_URL = "https://open.spotify.com/embed/playlist/{id}"
 
-# --- Apify: artist-id enrichment ------------------------------------------------
-# The embed gives us the track id and an artist *name* string, but no artist id.
-# When we can't resolve an artist id from social_golden_data.spotify_track_artists
-# (by name), we fall back to the same Apify actor ASP uses, called with /track
-# URLs; each returned item carries an `artists` list of {id, name}.
-SPOTIFY_ACTOR_ID = "beatanalytics/spotify-play-count-scraper"
-SPOTIFY_TRACK_URL = "https://open.spotify.com/track/{id}"
-# Env var holding the Apify API token (same name as ASP's spotify pipeline).
-APIFY_API_KEY_ENV = "SPOTIFY_API_KEY"
-
-# --- Open-stint state file ----------------------------------------------------
-# One JSON document tracks which (playlist, track) stints are currently open,
-# with each track's start date and last-seen date. Persisted on S3 in
-# production (bucket from S3_BUCKET_NAME, region from AWS_REGION); when
-# S3_BUCKET_NAME is unset it falls back to a local file (dev / --dry-run).
-STATE_S3_KEY = "editorial_playlist_state/open_stints.json"
-STATE_LOCAL_PATH = "editorial_state.json"
-
 # The embed page is meant for browsers; a plain requests User-Agent gets a 403
 # at the edge, so we send a browser-like one.
 HTTP_HEADERS = {
@@ -56,6 +38,16 @@ RETRY_BACKOFF = 2.0
 # The embed page returns at most this many tracks; a playlist at or above the cap
 # may be silently truncated.
 EMBED_TRACK_CAP = 100
+
+# Safety: if a playlist's fetched tracklist has at least this many *fewer* tracks
+# than we currently have open stints for it, treat the response as partial and
+# do NOT touch the DB for that playlist this run (see src/processor.py).
+PARTIAL_RESPONSE_DROP = 20
+
+# CloudWatch metric name emitted (as a JSON line on stdout) once per run with the
+# count of playlists skipped this run. A Terraform log-metric-filter + alarm
+# (terraform/alarms.tf) turn it into an alert.
+SKIPPED_METRIC = "editorials_playlists_skipped"
 
 
 @dataclass(frozen=True)

@@ -38,6 +38,3 @@ override.tf.json
 # OS
 .DS_Store
 Thumbs.db
-
-# Local open-stint state file (S3 in prod)
-editorial_state.json

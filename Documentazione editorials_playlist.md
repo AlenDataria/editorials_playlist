@@ -1,11 +1,10 @@
 # Documentazione editorials_playlist
 
-Pipeline che tiene aggiornata la storia di **tutte le tracce e tutti gli
-artisti** presenti nelle playlist editoriali di Spotify Italia che seguiamo. Non
-una riga al giorno, ma **una riga per _stint_** — un periodo continuo di
-permanenza di una traccia in un editoriale — con `start_date` ed `end_date`. Da
-qui si ricava in quanti editoriali è una traccia/un artista, da quando e per
-quanto.
+Pipeline che tiene aggiornata la storia di **tutte le tracce** presenti nelle
+playlist editoriali di Spotify Italia che seguiamo. Non una riga al giorno, ma
+**una riga per _stint_** — un periodo continuo di permanenza di una traccia in un
+editoriale — con `start_date` ed `end_date`, una riga per nome artista accreditato.
+Da qui si ricava in quanti editoriali è una traccia, da quando e per quanto.
 
 Stesso impianto infrastrutturale di `song_resolver_tracker`: Docker + ECS Fargate
 + EventBridge (run giornaliero) + deploy via GitHub OIDC + Terraform.
@@ -24,41 +23,40 @@ Una volta al giorno (`uv run main.py`):
    embed pubblico** `https://open.spotify.com/embed/playlist/{ID}` (parse del
    blob `__NEXT_DATA__` nell'HTML) e ne ricava `(track_id, titolo,
    stringa_artisti)`.
-3. **Diff sugli stint.** Si carica il **file di stato** (`src/state.py`) — un
-   JSON unico che elenca, per playlist, le tracce con stint aperto e per ognuna
-   `start` e `last_seen`. Sta su S3 (`editorial_playlist_state/open_stints.json`,
-   bucket da `S3_BUCKET_NAME`) o, se il bucket non è settato, su un file locale.
-   Per ogni editoriale scaricato si confrontano le tracce presenti ora con lo
-   stato:
-   - traccia presente **non** nello stato → **nuovo stint**: riga nello storico
-     con `start_date = oggi`, `end_date = NULL`; aggiunta allo stato;
-   - traccia presente **già** nello stato → niente sul DB; nello stato il suo
-     `last_seen` va a oggi;
-   - traccia nello stato ma **non più presente** → la riga aperta prende
-     `end_date = last_seen` (l'ultima data in cui c'era); tolta dallo stato.
-   Una playlist che fallisce il fetch (404 dopo i retry, errore, tracklist vuota)
-   viene saltata: le sue voci nello stato **non** si toccano.
-   Se il file di stato manca del tutto (primo run, o perso), viene ricostruito
-   dalle righe aperte (`end_date IS NULL`) del DB.
-4. **Artist id** (solo per le tracce che aprono un nuovo stint). L'embed dà il
-   nome degli artisti ma non l'id. Per ogni nome:
-   - **primario**: lookup in `social_golden_data.spotify_track_artists` per nome
-     normalizzato (qualsiasi traccia su cui quell'artista è già comparso);
-   - **fallback**: una chiamata Apify in batch (attore
-     `beatanalytics/spotify-play-count-scraper`, URL `/track/{id}`, batch da 100)
-     per le sole tracce nuove con almeno un artista non risolto; si legge
-     `item["artists"]` = lista `{id, name}`. Precedenza ai crediti per-traccia di
-     Apify, poi match per contenimento sul nome, poi le mappe globali.
-   - non risolto → `artist_id` resta `NULL`, la riga si scrive lo stesso.
-5. **Scrittura.** Per editoriale: `UPDATE end_date` per le chiusure + nuove righe
-   (una per `(traccia, artista)`), commit, poi `save` del file di stato. Re-run
-   nello stesso giorno = no-op (tutte le tracce già nello stato → solo `last_seen`
-   riaggiornato a oggi).
+3. **Diff sugli stint.** Il **DB è lo stato**: gli stint aperti sono le righe con
+   `end_date IS NULL`. Si legge `SELECT DISTINCT playlist_id, track_id FROM
+   editorial_playlists_storico WHERE end_date IS NULL` e per ogni editoriale
+   scaricato si confrontano le tracce presenti ora con quelle aperte:
+   - traccia presente, **nessuno** stint aperto → **nuovo stint**: una riga per
+     nome artista con `start_date = oggi`, `end_date = NULL`;
+   - traccia presente, stint **già aperto** → niente;
+   - traccia con stint aperto, **non più presente** → `end_date = oggi`.
+4. **Scrittura.** Per editoriale: un `UPDATE ... SET end_date = oggi` per le
+   chiusure + `add_all` delle nuove righe, commit. Re-run nello stesso giorno =
+   no-op (tutte le tracce già aperte → `to_keep`, niente da scrivere).
 
-> **Limite noto.** Se una traccia sparisce dall'embed per un solo giro (glitch,
-> troncamento a 100) e poi ricompare, viene chiusa e poi riaperta come nuovo
-> stint: nello storico compaiono due periodi con un buco di un giorno. È un
-> rischio accettato; si può ricucire lato SQL a valle se diventa ricorrente.
+### Protezioni sulle response
+
+- **Fetch fallito / tracklist vuota** → playlist saltata, stint aperti intatti.
+- **Response parziale** — la tracklist scaricata ha `PARTIAL_RESPONSE_DROP` (20)
+  o più tracce **in meno** rispetto agli stint attualmente aperti per quella
+  playlist → considerata rotta: playlist saltata, DB non toccato, `WARNING`.
+  Un ricambio legittimo (New Music Friday) ha una tracklist di dimensione
+  normale e non fa scattare la guardia. Una playlist che si rimpicciolisce
+  **davvero** continua a loggare `WARNING` a ogni run finché non si sistema a
+  mano.
+- **Circuit breaker** — se più di metà degli editoriali vengono saltati in un
+  run, il run abortisce con `exit(1)` (la task ECS risulta fallita) senza
+  scrivere niente.
+- **Metrica** — ogni run stampa su stdout `{"metric":
+  "editorials_playlists_skipped", "value": N}`; `terraform/alarms.tf` la
+  trasforma in metrica CloudWatch con allarme su `> 0`.
+
+> **Limite noto (rischio accettato).** Se una traccia sparisce dall'embed per un
+> solo giro (glitch, troncamento a 100) e poi ricompare — senza far scattare la
+> guardia "response parziale" — viene chiusa e riaperta come nuovo stint: nello
+> storico due periodi con un buco di un giorno. Si ricuce lato SQL a valle se
+> diventa ricorrente.
 
 ### Perché l'endpoint embed e non l'API ufficiale
 L'API ufficiale di Spotify restituisce **404** sugli editoriali (`37i9…`) per le
@@ -107,27 +105,25 @@ segnale).
 ### Struttura del repo
 
 ```
-main.py                       # load_dotenv → parse_args → EditorialsTracker(...).run()
-pyproject.toml                # deps: sqlmodel, psycopg2-binary, requests, python-dotenv, apify-client, boto3
+main.py                       # load_dotenv → parse_args → EditorialsTracker().run()
+pyproject.toml                # deps: sqlmodel, psycopg2-binary, requests, python-dotenv
 Dockerfile                    # python:3.13-slim + uv sync --frozen; CMD = uv run main.py
-terraform/                    # ECR, ECS cluster/task, ruoli IAM, 1 EventBridge schedule giornaliero
+terraform/                    # ECR, ECS cluster/task, ruoli IAM, EventBridge schedule + alarm
 src/
-  cli.py        # argparse: --dry-run, --no-apify, --log-level
-  consts.py     # DB_SCHEMA, EMBED_URL, HTTP_HEADERS, REQUEST_*, RETRY_*, Apify consts, STATE_*, EDITORIALS
+  cli.py        # argparse: --dry-run, --log-level
+  consts.py     # DB_SCHEMA, EMBED_URL, HTTP_HEADERS, REQUEST_*, RETRY_*, PARTIAL_RESPONSE_DROP, EDITORIALS
   db.py         # create_db_engine + retry_on_error + db_config_from_env
-  models.py     # SQLModel: EditorialPlaylist, EditorialPlaylistStorico (owned) + SpotifyTrackArtists (read-only)
+  models.py     # SQLModel: EditorialPlaylist, EditorialPlaylistStorico (owned)
   embed.py      # fetch_playlist_tracklist / parse_tracklist → list[PlaylistTrack]
-  artists.py    # normalize, split_artist_names, ArtistResolver (DB map + batched Apify fallback)
-  state.py      # StateStore (S3 o file locale) + helper sul documento di stato
-  processor.py  # EditorialsTracker: fetch → diff vs stato → apri / chiudi stint
+  artists.py    # split_artist_names (embed subtitle → lista nomi)
+  processor.py  # EditorialsTracker: fetch → guardie → diff vs righe aperte del DB → apri / chiudi stint
 sql/
   schema.sql    # DDL delle due tabelle
-  views.sql     # viste read-time (chi è dentro ora, conteggi per traccia/artista, tenure)
+  views.sql     # viste read-time (chi è dentro ora, conteggi per traccia/nome-artista, tenure)
 tests/
   test_embed.py           # parsing __NEXT_DATA__ da fixture HTML
-  test_artists.py         # normalize / split / ArtistResolver.resolve (no DB, no rete)
-  test_state.py           # StateStore in modalità file locale (round-trip)
-  test_processor_plan.py  # diff_playlist: apri / chiudi / mantieni
+  test_artists.py         # split_artist_names
+  test_processor_plan.py  # diff_playlist + is_partial_response
   test_editorials_live.py / test_editorials_order_live.py  # check di rete, solo con RUN_LIVE_TESTS=1
 ```
 
@@ -144,7 +140,7 @@ Di proprietà della pipeline, create a runtime con
 | `playlist_id` | text | PK |
 | `playlist_name` | text | da `EDITORIALS` |
 
-**`editorial_playlists_storico`** — uno stint per riga (una riga per artista).
+**`editorial_playlists_storico`** — uno stint per riga (una riga per nome artista).
 
 | colonna | tipo | note |
 |---|---|---|
@@ -153,28 +149,16 @@ Di proprietà della pipeline, create a runtime con
 | `playlist_name` | text | denormalizzato, comodo per le viste |
 | `track_name` | text | titolo lato playlist |
 | `track_id` | text | id Spotify della traccia (dall'embed) |
-| `artist_name` | text | un artista accreditato (split della stringa embed) |
-| `artist_id` | text | risolto da nostri dati o Apify; `NULL` se ignoto |
+| `artist_name` | text | un artista accreditato (split della stringa embed); `NULL` se non parseabile |
 | `start_date` | date | primo run che ha visto la traccia in questo stint |
-| `end_date` | date NULL | `NULL` finché la traccia è in playlist; alla chiusura = ultima data presente (`last_seen`) |
+| `end_date` | date NULL | `NULL` finché la traccia è in playlist; alla chiusura = data del run che l'ha trovata sparita |
 
-Grana: **una riga per (playlist, traccia, artista, stint)**. Quali stint sono
-aperti lo dice il file di stato (`src/state.py`), non lo storico: "traccia dentro
-adesso" = righe con `end_date IS NULL` (vista `vw_editorial_current`). Rientro
-dopo un'uscita = nuova riga. Re-run nello stesso giorno = no-op.
-
-**File di stato** (`open_stints.json`, S3 o locale):
-
-```json
-{
-  "updated_at": "2026-09-01T00:00:00+00:00",
-  "playlists": {
-    "<playlist_id>": {
-      "<track_id>": {"start": "2026-08-15", "last_seen": "2026-09-01"}
-    }
-  }
-}
-```
+Grana: **una riga per (playlist, traccia, nome artista, stint)**. Lo storico
+**è** lo stato: stint aperto = `end_date IS NULL` (= "traccia dentro adesso",
+vista `vw_editorial_current`). Indice unico parziale `ux_eps_open` su
+`(playlist_id, track_id, COALESCE(artist_name,'')) WHERE end_date IS NULL` → una
+sola riga aperta per (playlist, traccia, nome artista). Rientro dopo un'uscita =
+nuova riga. Re-run nello stesso giorno = no-op.
 
 ### `embed.py` — scraping
 
@@ -193,71 +177,51 @@ dopo un'uscita = nuova riga. Re-run nello stesso giorno = no-op.
 - se `pageProps.state is None` o `status == 404` alza `PlaylistUnavailable`
   (ritentabile — l'embed lo fa a intermittenza).
 
-### `state.py` — file di stato degli stint aperti
+### `artists.py`
 
-- `StateStore` — `load() -> dict | None` e `save(dict)`. Se `S3_BUCKET_NAME` è
-  settato usa S3 (`boto3`, key `STATE_S3_KEY`, region `AWS_REGION`), altrimenti
-  un file locale (`STATE_LOCAL_PATH`, override con `EDITORIAL_STATE_LOCAL_PATH`);
-- `open_stints(doc, playlist_id)` → il dict `{track_id: {start, last_seen}}` di
-  quella playlist (creato se assente);
-- `empty_doc()` → `{"playlists": {}}`.
-
-### `artists.py` — da nome ad `artist_id`
-
-- `normalize(s)` → `(s or "").strip().casefold()`;
-- `split_artist_names(subtitle)` → split su `","` con strip (il caso raro di un
-  nome che contiene una virgola, es. "Tyler, The Creator", viene spezzato —
-  accettato);
-- `ArtistResolver(engine, use_apify=…)`:
-  - `load_db_map()` — `SELECT DISTINCT artist_name, artist_id FROM
-    spotify_track_artists` → `{nome_normalizzato: artist_id}`;
-  - `is_known(name)` — usato dal processor per raccogliere le tracce che servono
-    ad Apify;
-  - `enrich_via_apify(track_ids)` — una chiamata all'attore ogni
-    `APIFY_BATCH_SIZE` (100) tracce; popola `{track_id: {nome: id}}` e una mappa
-    nome→id globale. Se manca `SPOTIFY_API_KEY` o `apify-client`, logga un
-    warning e prosegue (artist_id resta `NULL`);
-  - `resolve(track_id, name)` — crediti Apify per-traccia → contenimento sul
-    nome nei crediti di quella traccia → mappa nostri dati → mappa Apify globale
-    → `None`.
+Solo `split_artist_names(subtitle)` → split su `","` con strip (il caso raro di
+un nome che contiene una virgola, es. "Tyler, The Creator", viene spezzato —
+accettato). Lo storico tiene una riga per ogni nome così ottenuto.
 
 ### `processor.py` — orchestrazione
 
-`diff_playlist(present_ids, open_ids)` è la funzione pura testata: dato
-l'insieme delle tracce presenti ora e quello delle tracce con stint aperto
-(dallo stato), ritorna `(to_open, to_close, to_keep)`.
+Due funzioni pure testate:
+- `diff_playlist(present_ids, open_ids)` → `(to_open, to_close, to_keep)`;
+- `is_partial_response(present_count, open_count)` → `True` se
+  `open_count - present_count >= PARTIAL_RESPONSE_DROP` (20).
 
-`EditorialsTracker(use_apify=…).run(dry_run=…)`:
-1. fetch di **tutti** gli editoriali (skip + log su 404/errore/tracklist vuota);
-2. `StateStore().load()`; se `None` → `_reconstruct_state(db)` (righe con
-   `end_date IS NULL`; se la tabella non esiste ancora → stato vuoto, utile per
-   `--dry-run` prima della creazione);
-3. `diff_playlist` per ogni playlist; `ArtistResolver.load_db_map()`; raccolta
-   dei `track_id` **solo tra i `to_open`** con un artista non noto → un
-   `enrich_via_apify(...)` unico;
-4. per editoriale: `UPDATE ... SET end_date = last_seen` per i `to_close`,
-   `add_all` delle righe dei nuovi stint (una per traccia×artista; traccia senza
-   artisti parseabili → una riga con `artist_name`/`artist_id` `NULL`), commit,
-   poi aggiornamento in memoria del documento di stato e `StateStore().save(doc)`;
-5. `--dry-run` logga il piano (nuovi stint, chiusure, mantenuti) e non scrive
-   (né DB né file di stato); `--no-apify` salta il fallback.
+`EditorialsTracker().run(dry_run=…)`:
+1. fetch di **tutti** gli editoriali (skip + log su 404/errore/tracklist vuota),
+   i nomi dei falliti in `fetch_failed`;
+2. `_open_stints(db)` → `{playlist_id: {track_id}}` da `end_date IS NULL` (se la
+   tabella non esiste ancora → dict vuoto + warning, per `--dry-run`);
+3. `diff_playlist` + `is_partial_response` per ogni playlist; le parziali vanno
+   in `partial` con un `WARNING`;
+4. `skipped = len(fetch_failed) + len(partial)` → stampa
+   `{"metric": "editorials_playlists_skipped", "value": skipped}` su stdout;
+5. **circuit breaker**: se `skipped > len(EDITORIALS)//2` → `ERROR` + `exit(1)`
+   (in `--dry-run` solo `ERROR` e `return`), niente scritture;
+6. per editoriale **non** parziale: un `UPDATE ... SET end_date = oggi` per i
+   `to_close` (`track_id IN (...) AND end_date IS NULL`), `add_all` delle righe
+   dei nuovi stint (una per nome artista; traccia senza artisti parseabili → una
+   riga con `artist_name` `NULL`), commit;
+7. riga finale: `fetched N/15, opened X, closed Y, skipped Z [lista playlist]`;
+8. `--dry-run` logga il piano e non scrive.
 
 ### `cli.py` / `main.py` / env
-`--dry-run`, `--no-apify`, `--log-level`. `main.py`: `load_dotenv()` →
-`logging.basicConfig` → `EditorialsTracker(use_apify=not args.no_apify).run(...)`.
-Env: `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_PORT` (default 5432),
-`SPOTIFY_API_KEY` (token Apify, stesso nome di ASP), `S3_BUCKET_NAME` +
-`AWS_REGION` per il file di stato (non settati → file locale).
+`--dry-run`, `--log-level`. `main.py`: `load_dotenv()` → `logging.basicConfig` →
+`EditorialsTracker().run(dry_run=…)`. Env: solo `DB_HOST`, `DB_NAME`, `DB_USER`,
+`DB_PASSWORD`, `DB_PORT` (default 5432).
 
 ### Deploy
 `terraform/` è la copia adattata di song_resolver_tracker: ECR repo
 `editorials-playlist-app`, cluster/task ECS, ruoli IAM, **un** EventBridge
 schedule giornaliero che lancia `uv run main.py`, ruolo GitHub OIDC per il push
-immagini. `secrets_manager_keys` inietta `DB_*` **e** `SPOTIFY_API_KEY` da
-Secrets Manager. `state_s3_bucket` → il task role ottiene
-`s3:GetObject`/`s3:PutObject` su `editorial_playlist_state/*` e `S3_BUCKET_NAME` +
-`AWS_REGION` finiscono nell'`environment` del container. Lo schedule nasce
-`DISABLED` (review): passare a `ENABLED` e ri-applicare per far partire i run.
+immagini. `secrets_manager_keys` inietta solo `DB_*` da Secrets Manager.
+`alarms.tf` → log-metric-filter sulla riga JSON `editorials_playlists_skipped` +
+`aws_cloudwatch_metric_alarm` su `> 0` (azione SNS opzionale via
+`alarm_sns_topic_arn`). Lo schedule nasce `DISABLED` (review): passare a
+`ENABLED` e ri-applicare per far partire i run.
 
 ---
 
@@ -267,8 +231,8 @@ Secrets Manager. `state_s3_bucket` → il task role ottiene
 `sql/views.sql` (tutte in lettura, senza toccare la pipeline):
 
 ### `vw_editorial_current` — chi è dentro adesso
-Le righe con `end_date IS NULL`: la tracklist corrente (traccia + artista) di
-ogni editoriale ricostruita dallo storico. Base delle due viste sotto.
+Le righe con `end_date IS NULL`: la tracklist corrente (traccia + nome artista)
+di ogni editoriale ricostruita dallo storico. Base delle due viste sotto.
 
 ### a) In quanti editoriali è una traccia — `vw_track_editorial_count`
 Per `track_id` (sulle righe "current"): numero di editoriali distinti e la lista
@@ -277,8 +241,9 @@ traccia si diffonde tra le curatele), resta piatto o cala (Spotify la sta
 ritirando — spesso il primo segnale che l'onda è finita).
 
 ### b) In quanti editoriali è un artista — `vw_artist_editorial_count`
-Come sopra ma per `artist_id` (una qualsiasi delle sue tracce): editoriali
-distinti, tracce distinte, lista nomi. Utile per report artista-centrici.
+Come sopra ma per `artist_name` (una qualsiasi delle sue tracce): editoriali
+distinti, tracce distinte, lista nomi. Attenzione alle omonimie e alle varianti
+di scrittura dei feat. (niente `artist_id` in questa pipeline).
 
 ### c) Durata degli stint — `vw_track_editorial_tenure`
 Una riga per stint `(track_id, playlist_id, start_date, end_date)`:
@@ -291,23 +256,26 @@ successivo è il tempo passato fuori.
 
 ## Verifica end-to-end
 
-1. `uv sync`; `.env` con `DB_*` e `SPOTIFY_API_KEY` (lascia `S3_BUCKET_NAME`
-   vuoto per usare il file di stato locale).
-2. `uv run python -m pytest` → verde (embed + artisti + state + `diff_playlist`).
-3. `uv run main.py --dry-run --no-apify` → per ogni playlist logga
-   `"<nome>: N tracks"` e il piano (open / close / keep); non scrive né DB né
-   file di stato.
+1. `uv sync`; `.env` con i soli `DB_*`.
+2. `uv run python -m pytest` → verde (embed + `split_artist_names` +
+   `diff_playlist` + `is_partial_response`).
+3. `uv run main.py --dry-run` → per ogni playlist logga `"<nome>: N tracks"` e
+   il piano (open / close / keep); stampa la riga `metric` e il summary; non
+   scrive.
 4. `uv run main.py` (primo giro) → tutto apre nuovi stint (`end_date` NULL);
    `select count(*), count(end_date) from
    social_golden_data.editorial_playlists_storico` (il secondo deve essere 0);
-   `editorial_playlists` popolata con 15 righe; nasce `editorial_state.json`.
-5. `uv run main.py` (secondo giro, stesso giorno) → no-op: 0 open, 0 close, solo
-   `last_seen` aggiornato nel file di stato.
-6. Simulare il giorno dopo (o attendere il run successivo): una traccia tolta a
-   mano dal file di stato ricompare come nuovo stint; se sparisce dall'editoriale
-   la sua riga prende `end_date`.
-7. Applicare `sql/views.sql`; `select * from
+   `editorial_playlists` popolata con 15 righe.
+5. `uv run main.py` (secondo giro, stesso giorno) → no-op: 0 open, 0 close,
+   `skipped 0`.
+6. Chiudere a mano una riga (`update ... set end_date = current_date where ...`)
+   e verificare che al run successivo la traccia ricompare come **nuovo** stint;
+   una traccia sparita dall'editoriale prende `end_date`.
+7. Guardia: troncare a mano l'input (o simulare) così una playlist torna con
+   ≥ 20 tracce in meno degli stint aperti → `WARNING` "PARTIAL", quella playlist
+   non tocca il DB, `metric value` incrementato.
+8. Applicare `sql/views.sql`; `select * from
    social_golden_data.vw_editorial_current where playlist_id = '…'`.
-8. Deploy: `terraform apply` (passare `github_oidc_provider_arn`,
-   `secrets_manager_arn`, `state_s3_bucket`), poi trigger manuale della task ECS
-   e check dei CloudWatch logs.
+9. Deploy: `terraform apply` (passare `github_oidc_provider_arn`,
+   `secrets_manager_arn`, opz. `alarm_sns_topic_arn`), poi trigger manuale della
+   task ECS e check dei CloudWatch logs + allarme.

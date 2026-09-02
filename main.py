@@ -20,11 +20,8 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    logger.info(
-        "starting editorials_playlist run (dry_run=%s, no_apify=%s)",
-        args.dry_run, args.no_apify,
-    )
-    EditorialsTracker(use_apify=not args.no_apify).run(dry_run=args.dry_run)
+    logger.info("starting editorials_playlist run (dry_run=%s)", args.dry_run)
+    EditorialsTracker().run(dry_run=args.dry_run)
 
 
 if __name__ == "__main__":

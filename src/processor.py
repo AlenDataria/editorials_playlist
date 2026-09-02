@@ -1,37 +1,48 @@
 """EditorialsTracker: the daily run.
 
 The pipeline keeps one row per *stint* — a continuous period a track spent in an
-editorial playlist. Which stints are currently open is held in a small JSON
-state document (src/state.py), not inferred from the history table:
+editorial playlist. The database is the state: a stint is open while its
+`end_date` is NULL. Each run:
 
-  - track in the playlist now, not in the state    -> new row (`end_date` NULL),
-    artists resolved via src/artists.py; added to the state;
-  - track in the playlist now and in the state      -> nothing in the DB; its
-    `last_seen` in the state is moved to today;
-  - track in the state but gone from the playlist   -> its open row gets
-    `end_date = last_seen` (the last date it was there); removed from the state.
+  - track in the playlist now, no open stint   -> new row (`end_date` NULL);
+  - track in the playlist now, already open    -> nothing;
+  - track with an open stint, gone now         -> `end_date = today`.
 
-A playlist that fails to fetch (or returns nothing) is logged and skipped: its
-state entries are left untouched, so nothing is closed by mistake. The DB
-changes and the state file are written per playlist.
+Safety rails against bad embed responses:
+  - a playlist that fails to fetch, or returns nothing, is skipped;
+  - a playlist whose tracklist is >= PARTIAL_RESPONSE_DROP tracks shorter than
+    its current open-stint count is treated as a partial response: skipped, DB
+    untouched, loud WARNING;
+  - if more than half the editorials are skipped for any of those reasons, the
+    run aborts without writing anything (circuit breaker);
+  - the count of skipped playlists is emitted as a CloudWatch metric.
 """
 
+import json
 import logging
+import sys
 import time
+from collections import defaultdict
 from datetime import date
 
 import requests
-from sqlalchemy import func, select, update
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlmodel import Session, SQLModel
 
-from src.artists import ArtistResolver, split_artist_names
-from src.consts import EDITORIALS, HTTP_HEADERS, REQUEST_DELAY, Editorial
+from src.artists import split_artist_names
+from src.consts import (
+    EDITORIALS,
+    HTTP_HEADERS,
+    PARTIAL_RESPONSE_DROP,
+    REQUEST_DELAY,
+    SKIPPED_METRIC,
+    Editorial,
+)
 from src.db import create_db_engine, db_config_from_env
 from src.embed import PlaylistTrack, PlaylistUnavailable, fetch_playlist_tracklist
 from src.models import EditorialPlaylist, EditorialPlaylistStorico
-from src.state import StateStore, empty_doc, open_stints
 
 logger = logging.getLogger(__name__)
 
@@ -41,12 +52,12 @@ _OWNED_TABLES = [EditorialPlaylist.__table__, EditorialPlaylistStorico.__table__
 def diff_playlist(
     present_ids: set[str], open_ids: set[str]
 ) -> tuple[set[str], set[str], set[str]]:
-    """Split the current tracklist against the open-stint state.
+    """Split the current tracklist against the open stints in the DB.
 
     Returns (to_open, to_close, to_keep):
-      - to_open  : present now, no open stint      -> start a new stint;
-      - to_close : had an open stint, gone now     -> close it;
-      - to_keep  : present now and already open    -> just refresh last_seen.
+      - to_open  : present now, no open stint   -> start a new stint;
+      - to_close : had an open stint, gone now  -> close it;
+      - to_keep  : present now and already open -> nothing to do.
     """
     return (
         present_ids - open_ids,
@@ -55,12 +66,27 @@ def diff_playlist(
     )
 
 
+def is_partial_response(present_count: int, open_count: int) -> bool:
+    """True when today's tracklist is suspiciously short vs the open stints.
+
+    `present_count` tracks came back; we currently have `open_count` open stints
+    for that playlist. A drop of PARTIAL_RESPONSE_DROP or more is treated as a
+    partial/broken response, not a real mass exit.
+    """
+    return open_count - present_count >= PARTIAL_RESPONSE_DROP
+
+
+def _emit_metric(name: str, value: int) -> None:
+    """One JSON line on stdout; a Terraform log-metric-filter turns it into a
+    CloudWatch metric (terraform/alarms.tf)."""
+    print(json.dumps({"metric": name, "value": value}), flush=True)
+
+
 class EditorialsTracker:
     """Maintain the stint history of every track in the tracked editorials."""
 
-    def __init__(self, *, use_apify: bool = True) -> None:
+    def __init__(self) -> None:
         self.engine = create_db_engine(db_config_from_env())
-        self.use_apify = use_apify
         self.session = requests.Session()
         self.session.headers.update(HTTP_HEADERS)
 
@@ -92,40 +118,28 @@ class EditorialsTracker:
         db.execute(stmt)
         db.commit()
 
-    def _reconstruct_state(self, db: Session) -> dict:
-        """Rebuild the state document from the open rows in the DB.
-
-        Used only when the state file is missing (first run, or it was lost):
-        without this every open track would look new and get a duplicate row.
-        """
-        doc = empty_doc()
+    def _open_stints(self, db: Session) -> dict[str, set[str]]:
+        """Currently-open stints, straight from the DB: {playlist_id: {track_id}}."""
+        open_by_playlist: dict[str, set[str]] = defaultdict(set)
         try:
             rows = db.execute(
                 select(
                     EditorialPlaylistStorico.playlist_id,
                     EditorialPlaylistStorico.track_id,
-                    func.min(EditorialPlaylistStorico.start_date),
                 )
                 .where(EditorialPlaylistStorico.end_date.is_(None))
-                .group_by(
-                    EditorialPlaylistStorico.playlist_id,
-                    EditorialPlaylistStorico.track_id,
-                )
+                .distinct()
             ).all()
         except SQLAlchemyError:
             db.rollback()
             logger.warning(
-                "could not read %s - starting from an empty state",
+                "could not read %s (not created yet?) - treating every track as new",
                 EditorialPlaylistStorico.__tablename__,
             )
-            return doc
-
-        for playlist_id, track_id, start in rows:
-            iso = start.isoformat()
-            open_stints(doc, playlist_id)[track_id] = {"start": iso, "last_seen": iso}
-        if rows:
-            logger.warning("rebuilt state from %d open rows in the DB", len(rows))
-        return doc
+            return open_by_playlist
+        for playlist_id, track_id in rows:
+            open_by_playlist[playlist_id].add(track_id)
+        return open_by_playlist
 
     # ------------------------------------------------------------------ #
     # run                                                               #
@@ -137,6 +151,7 @@ class EditorialsTracker:
 
         # 1. fetch every playlist up front
         fetched: list[tuple[Editorial, list[PlaylistTrack]]] = []
+        fetch_failed: list[str] = []
         for ed in EDITORIALS:
             try:
                 tracklist = fetch_playlist_tracklist(ed.playlist_id, self.session)
@@ -145,66 +160,68 @@ class EditorialsTracker:
                     "editorial %s (%s) still 404s after retries - skipping",
                     ed.name, ed.playlist_id,
                 )
+                fetch_failed.append(ed.name)
             except Exception:
                 logger.exception("skipping editorial %s (%s)", ed.name, ed.playlist_id)
+                fetch_failed.append(ed.name)
             else:
                 if not tracklist:
                     logger.warning(
-                        "editorial %s (%s) returned no tracks - skipping (state "
-                        "left untouched)", ed.name, ed.playlist_id,
+                        "editorial %s (%s) returned no tracks - skipping",
+                        ed.name, ed.playlist_id,
                     )
+                    fetch_failed.append(ed.name)
                 else:
                     fetched.append((ed, tracklist))
                     logger.info("%s: %d tracks", ed.name, len(tracklist))
             time.sleep(REQUEST_DELAY)
 
-        store = StateStore()
-        doc = store.load()
-
         with Session(self.engine) as db:
             if not dry_run:
                 self._upsert_registry(db)
-            if doc is None:
-                logger.warning(
-                    "no state file at %s - reconstructing from the DB", store.location
-                )
-                doc = self._reconstruct_state(db)
 
-            # 2. plan per playlist, then resolve artist ids for the new tracks only
+            open_by_playlist = self._open_stints(db)
+
+            # 2. per-playlist plan + partial-response check
             plans: dict[str, tuple[set[str], set[str], set[str]]] = {}
+            partial: list[str] = []  # names of playlists with a suspicious response
             for ed, tracklist in fetched:
                 present_ids = {pt.spotify_id for pt in tracklist}
-                open_ids = set(open_stints(doc, ed.playlist_id))
+                open_ids = open_by_playlist.get(ed.playlist_id, set())
                 plans[ed.playlist_id] = diff_playlist(present_ids, open_ids)
+                if is_partial_response(len(present_ids), len(open_ids)):
+                    partial.append(ed.name)
+                    logger.warning(
+                        "%s: %d tracks vs %d open stints (>= %d fewer) - response "
+                        "looks PARTIAL, not touching the DB for this playlist",
+                        ed.name, len(present_ids), len(open_ids), PARTIAL_RESPONSE_DROP,
+                    )
 
-            resolver = ArtistResolver(self.engine, use_apify=self.use_apify)
-            resolver.load_db_map()
+            skipped_total = len(fetch_failed) + len(partial)
+            _emit_metric(SKIPPED_METRIC, skipped_total)
 
-            need_apify: set[str] = set()
-            for ed, tracklist in fetched:
-                to_open, _, _ = plans[ed.playlist_id]
-                for pt in tracklist:
-                    if pt.spotify_id not in to_open:
-                        continue
-                    if any(
-                        not resolver.is_known(n)
-                        for n in split_artist_names(pt.artists)
-                    ):
-                        need_apify.add(pt.spotify_id)
-            if need_apify:
-                logger.info(
-                    "%d new tracks need an Apify lookup for artist ids", len(need_apify)
+            # 3. circuit breaker: too many playlists unusable -> abort, write nothing
+            if skipped_total > len(EDITORIALS) // 2:
+                logger.error(
+                    "circuit breaker: %d/%d editorials skipped this run "
+                    "(fetch-failed: %s | partial: %s) - aborting without writing",
+                    skipped_total, len(EDITORIALS),
+                    ", ".join(fetch_failed) or "-", ", ".join(partial) or "-",
                 )
-                resolver.enrich_via_apify(need_apify)
+                if not dry_run:
+                    sys.exit(1)
+                return
 
-            # 3. apply per playlist: close, open, refresh last_seen, save state
+            # 4. apply per playlist: close the gone ones, insert the new stints
+            partial_ids = {
+                ed.playlist_id for ed, _ in fetched if ed.name in partial
+            }
             opened = closed = 0
             for ed, tracklist in fetched:
+                if ed.playlist_id in partial_ids:
+                    continue
                 to_open, to_close, to_keep = plans[ed.playlist_id]
-                pl_state = open_stints(doc, ed.playlist_id)
-                new_rows = self._rows_for_new_stints(
-                    ed, tracklist, to_open, resolver, today
-                )
+                new_rows = self._rows_for_new_stints(ed, tracklist, to_open, today)
                 opened += len(to_open)
                 closed += len(to_close)
 
@@ -214,24 +231,18 @@ class EditorialsTracker:
                         ed.name, len(to_open), len(new_rows), len(to_close),
                         len(to_keep),
                     )
-                    for r in new_rows:
-                        logger.info(
-                            "  open: %s - %s  track=%s artist=%s",
-                            r.track_name, r.artist_name, r.track_id, r.artist_id,
-                        )
                     continue
 
                 try:
-                    for track_id in to_close:
-                        last_seen = date.fromisoformat(pl_state[track_id]["last_seen"])
+                    if to_close:
                         db.execute(
                             update(EditorialPlaylistStorico)
                             .where(
                                 EditorialPlaylistStorico.playlist_id == ed.playlist_id,
-                                EditorialPlaylistStorico.track_id == track_id,
+                                EditorialPlaylistStorico.track_id.in_(to_close),
                                 EditorialPlaylistStorico.end_date.is_(None),
                             )
-                            .values(end_date=last_seen)
+                            .values(end_date=today)
                         )
                     db.add_all(new_rows)
                     db.commit()
@@ -242,21 +253,13 @@ class EditorialsTracker:
                     closed -= len(to_close)
                     continue
 
-                for track_id in to_close:
-                    pl_state.pop(track_id, None)
-                for track_id in to_keep:
-                    pl_state[track_id]["last_seen"] = today.isoformat()
-                for pt in tracklist:
-                    if pt.spotify_id in to_open:
-                        pl_state[pt.spotify_id] = {
-                            "start": today.isoformat(),
-                            "last_seen": today.isoformat(),
-                        }
-                store.save(doc)
-
+            skipped_names = fetch_failed + [f"{n} (partial)" for n in partial]
             logger.info(
-                "done: %s - opened %d, closed %d, across %d editorials",
-                today, opened, closed, len(fetched),
+                "done: %s - fetched %d/%d playlists, opened %d, closed %d, "
+                "skipped %d%s",
+                today, len(fetched), len(EDITORIALS), opened, closed,
+                skipped_total,
+                f" [{', '.join(skipped_names)}]" if skipped_names else "",
             )
 
     # ------------------------------------------------------------------ #
@@ -267,21 +270,18 @@ class EditorialsTracker:
         editorial: Editorial,
         tracklist: list[PlaylistTrack],
         to_open: set[str],
-        resolver: ArtistResolver,
         today: date,
     ) -> list[EditorialPlaylistStorico]:
-        """One row per (track, artist) for the tracks starting a new stint.
+        """One row per (track, artist name) for the tracks starting a new stint.
 
         A track with no parseable artist string still yields a single row (with
-        artist_name and artist_id NULL) so the stint is recorded.
+        artist_name NULL) so the stint is recorded.
         """
         rows: list[EditorialPlaylistStorico] = []
         for pt in tracklist:
             if pt.spotify_id not in to_open:
                 continue
-            names = split_artist_names(pt.artists) or [None]
-            for name in names:
-                artist_id = resolver.resolve(pt.spotify_id, name) if name else None
+            for name in split_artist_names(pt.artists) or [None]:
                 rows.append(
                     EditorialPlaylistStorico(
                         playlist_id=editorial.playlist_id,
@@ -289,7 +289,6 @@ class EditorialsTracker:
                         track_name=pt.title or None,
                         track_id=pt.spotify_id,
                         artist_name=name,
-                        artist_id=artist_id,
                         start_date=today,
                         end_date=None,
                     )

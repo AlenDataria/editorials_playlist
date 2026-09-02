@@ -20,16 +20,17 @@ GROUP BY track_id;
 
 
 -- b) How many editorials an artist is currently in (any of their tracks).
+--    Keyed on the artist name from the embed (no artist id in this pipeline);
+--    beware name collisions / "feat." spelling differences.
 CREATE OR REPLACE VIEW social_golden_data.vw_artist_editorial_count AS
 SELECT
-    artist_id,
-    max(artist_name)                                    AS artist_name,
+    artist_name,
     count(DISTINCT playlist_id)                         AS editorial_count,
     count(DISTINCT track_id)                            AS track_count,
     array_agg(DISTINCT playlist_name ORDER BY playlist_name) AS playlists
 FROM social_golden_data.vw_editorial_current
-WHERE artist_id IS NOT NULL
-GROUP BY artist_id;
+WHERE artist_name IS NOT NULL
+GROUP BY artist_name;
 
 
 -- c) Tenure: every stint of a track in an editorial, with its length and
