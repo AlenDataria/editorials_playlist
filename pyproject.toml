@@ -9,6 +9,7 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "requests>=2.32",
     "sqlmodel>=0.0.38",
+    "tzdata>=2025.1",
 ]
 
 [dependency-groups]

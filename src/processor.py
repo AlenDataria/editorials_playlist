@@ -23,7 +23,8 @@ import logging
 import sys
 import time
 from collections import defaultdict
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import requests
 from sqlalchemy import select, update
@@ -37,6 +38,7 @@ from src.consts import (
     HTTP_HEADERS,
     PARTIAL_RESPONSE_DROP,
     REQUEST_DELAY,
+    RUN_TIMEZONE,
     SKIPPED_METRIC,
     Editorial,
 )
@@ -145,7 +147,7 @@ class EditorialsTracker:
     # run                                                               #
     # ------------------------------------------------------------------ #
     def run(self, dry_run: bool = False) -> None:
-        today = date.today()
+        today = datetime.now(ZoneInfo(RUN_TIMEZONE)).date()
         if not dry_run:
             self._ensure_tables()
 

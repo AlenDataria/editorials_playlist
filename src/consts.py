@@ -25,6 +25,11 @@ HTTP_HEADERS = {
     "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
 }
 
+# A run's date (start_date / end_date) is "today" in this timezone, so the
+# 00:00 Europe/Rome scheduled run is stamped with the Italian calendar day
+# rather than the container's UTC day.
+RUN_TIMEZONE = "Europe/Rome"
+
 REQUEST_TIMEOUT = 30
 # Seconds to wait between playlist fetches — the endpoint is public and we only
 # hit it ~15 times per run, so this is politeness, not a hard rate limit.
